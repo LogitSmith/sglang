@@ -93,7 +93,11 @@ if _is_cuda:
             layer_id=layer_id,
         )
         if result is not None:
-            output.copy_(result)
+            # PCG replay batch can differ from capture-time token count; buffers are pre-sized.
+            n = min(result.shape[0], output.shape[0])
+            output[:n].copy_(result[:n])
+            if output.shape[0] > n:
+                output[n:].fill_(-1)
         else:
             output.fill_(-1)
 
