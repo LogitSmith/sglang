@@ -1246,6 +1246,10 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # Piecewise CUDA graph: attention_layers[] stores attn_mqa (RadixAttention), not this MLA
+        # module; nsa_indexer_op resolves the indexer from context.attention_layers[layer_id].
+        if self.use_nsa:
+            self.attn_mqa.indexer = self.indexer
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,

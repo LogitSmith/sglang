@@ -78,8 +78,14 @@ if _is_cuda:
         context = get_forward_context()
         assert context is not None
         forward_batch = context.forward_batch
-        attn_layer = context.attention_layers[layer_id]
-        result = attn_layer.indexer(
+        # attention_layers[] is RadixAttention (attn_mqa); indexer lives on parent MLA but is
+        # aliased onto attn_mqa as .indexer in deepseek_v2.DeepseekV2AttentionMLA.__init__.
+        radix = context.attention_layers[layer_id]
+        indexer = getattr(radix, "indexer", None)
+        assert indexer is not None, (
+            "NSA PCG: expected RadixAttention.indexer; set attn_mqa.indexer on the MLA module."
+        )
+        result = indexer(
             x=hidden_states,
             q_lora=q_lora,
             positions=positions,
