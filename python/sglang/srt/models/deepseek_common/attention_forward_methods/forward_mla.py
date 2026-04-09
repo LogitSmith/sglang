@@ -4,7 +4,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -33,6 +36,7 @@ if TYPE_CHECKING:
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
 
+    from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
 
     # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
@@ -57,6 +61,33 @@ if _is_cuda:
             )
         _bmm_fp8_op(A, B, out, A_scale, B_scale)
         return out
+
+    # Opaque boundary for piecewise CUDA graph: indexer uses .item() and host logic;
+    # Dynamo must not trace into it (see unified_attention_with_output for attention only).
+    @register_custom_op(mutates_args=["output"])
+    @register_split_op()
+    def nsa_indexer_with_output(
+        hidden_states: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        layer_id: int,
+        output: torch.Tensor,
+    ) -> None:
+        context = get_forward_context()
+        assert context is not None
+        forward_batch = context.forward_batch
+        attn_layer = context.attention_layers[layer_id]
+        result = attn_layer.indexer(
+            x=hidden_states,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+        )
+        if result is not None:
+            output.copy_(result)
+        else:
+            output.fill_(-1)
 
 
 if _use_aiter:
@@ -83,6 +114,45 @@ class DeepseekMLAForwardMixin:
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
         )
+
+    def _call_nsa_indexer_for_prepare(
+        self: DeepseekV2AttentionMLA,
+        hidden_states,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """NSA indexer under piecewise CUDA graph uses an opaque custom op so Dynamo does not trace it."""
+        if not _is_cuda:
+            return self.indexer(
+                x=hidden_states,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
+        if get_forward_context() is None or isinstance(hidden_states, tuple):
+            return self.indexer(
+                x=hidden_states,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
+        out = torch.full(
+            (hidden_states.shape[0], self.indexer.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        nsa_indexer_with_output(
+            hidden_states,
+            q_lora,
+            positions,
+            self.layer_id,
+            out,
+        )
+        return out
 
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
@@ -182,24 +252,22 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
+                topk_indices = self._call_nsa_indexer_for_prepare(
+                    hidden_states,
+                    q_lora,
+                    positions,
+                    forward_batch,
                 )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
+                    topk_indices = self._call_nsa_indexer_for_prepare(
+                        hidden_states,
+                        q_lora,
+                        positions,
+                        forward_batch,
                     )
         else:
             q = self.q_proj(hidden_states)[0].view(
