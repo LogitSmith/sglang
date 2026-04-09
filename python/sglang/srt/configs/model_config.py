@@ -209,6 +209,7 @@ class ModelConfig:
             self.hf_config.architectures
         )
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        # NSA: PCG supported via nsa_indexer_op in forward_mla.py (no blanket disable).
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
         )
@@ -1349,6 +1350,7 @@ multimodal_model_archs = [
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [
+    # DeepseekV32 / GlmMoeDsa: removed; NSA indexer uses opaque custom op for PCG.
     "Qwen3NextForCausalLM",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",

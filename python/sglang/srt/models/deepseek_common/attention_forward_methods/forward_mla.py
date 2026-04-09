@@ -64,15 +64,17 @@ if _is_cuda:
 
     # Opaque boundary for piecewise CUDA graph: indexer uses .item() and host logic;
     # Dynamo must not trace into it (see unified_attention_with_output for attention only).
+    # Named like the patch (nsa_indexer_op); register_split_op keeps PCG split boundaries consistent.
     @register_custom_op(mutates_args=["output"])
     @register_split_op()
-    def nsa_indexer_with_output(
+    def nsa_indexer_op(
         hidden_states: torch.Tensor,
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         layer_id: int,
         output: torch.Tensor,
     ) -> None:
+        """Opaque wrapper: indexer forward may use .item() / host branching (patch 0001)."""
         context = get_forward_context()
         assert context is not None
         forward_batch = context.forward_batch
@@ -115,44 +117,54 @@ class DeepseekMLAForwardMixin:
             get_global_server_args().flashinfer_mla_disable_ragged
         )
 
-    def _call_nsa_indexer_for_prepare(
+    def _call_indexer_maybe_custom_op(
         self: DeepseekV2AttentionMLA,
         hidden_states,
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        """NSA indexer under piecewise CUDA graph uses an opaque custom op so Dynamo does not trace it."""
-        if not _is_cuda:
-            return self.indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
+        """Patch 0001: under PCG, wrap indexer in opaque op; else call indexer directly.
+
+        Aligns with tuple `hidden_states` (FP8 paths): use same shape/device as patch.
+        Keeps `register_split_op` on `nsa_indexer_op` (not in original patch) for PCG splits.
+        """
+        if (
+            _is_cuda
+            and get_forward_context() is not None
+            and self.use_nsa
+        ):
+            n_tok = (
+                hidden_states.shape[0]
+                if not isinstance(hidden_states, tuple)
+                else hidden_states[0].shape[0]
             )
-        if get_forward_context() is None or isinstance(hidden_states, tuple):
-            return self.indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
+            dev = (
+                hidden_states.device
+                if not isinstance(hidden_states, tuple)
+                else hidden_states[0].device
             )
-        out = torch.full(
-            (hidden_states.shape[0], self.indexer.index_topk),
-            -1,
-            dtype=torch.int32,
-            device=hidden_states.device,
+            topk_output = torch.full(
+                (n_tok, self.indexer.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=dev,
+            )
+            nsa_indexer_op(
+                hidden_states,
+                q_lora,
+                positions,
+                self.layer_id,
+                topk_output,
+            )
+            return topk_output
+        return self.indexer(
+            x=hidden_states,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
         )
-        nsa_indexer_with_output(
-            hidden_states,
-            q_lora,
-            positions,
-            self.layer_id,
-            out,
-        )
-        return out
 
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
@@ -252,7 +264,7 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self._call_nsa_indexer_for_prepare(
+                topk_indices = self._call_indexer_maybe_custom_op(
                     hidden_states,
                     q_lora,
                     positions,
@@ -263,7 +275,7 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
-                    topk_indices = self._call_nsa_indexer_for_prepare(
+                    topk_indices = self._call_indexer_maybe_custom_op(
                         hidden_states,
                         q_lora,
                         positions,
