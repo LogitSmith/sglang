@@ -62,24 +62,20 @@ if _is_cuda:
         _bmm_fp8_op(A, B, out, A_scale, B_scale)
         return out
 
-    # Opaque boundary for piecewise CUDA graph: indexer uses .item() and host logic;
-    # Dynamo must not trace into it (see unified_attention_with_output for attention only).
-    # Named like the patch (nsa_indexer_op); register_split_op keeps PCG split boundaries consistent.
-    @register_custom_op(mutates_args=["output"])
-    @register_split_op()
-    def nsa_indexer_op(
+    import os as _os
+    _INDEXER_NO_SPLIT = _os.environ.get("SGLANG_INDEXER_NO_SPLIT", "0") == "1"
+
+    def _nsa_indexer_impl(
         hidden_states: torch.Tensor,
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         layer_id: int,
         output: torch.Tensor,
     ) -> None:
-        """Opaque wrapper: indexer forward may use .item() / host branching (patch 0001)."""
+        """Core implementation shared by both split and no-split variants."""
         context = get_forward_context()
         assert context is not None
         forward_batch = context.forward_batch
-        # attention_layers[] is RadixAttention (attn_mqa); indexer lives on parent MLA but is
-        # aliased onto attn_mqa as .indexer in deepseek_v2.DeepseekV2AttentionMLA.__init__.
         radix = context.attention_layers[layer_id]
         indexer = getattr(radix, "indexer", None)
         assert indexer is not None, (
@@ -93,13 +89,45 @@ if _is_cuda:
             layer_id=layer_id,
         )
         if result is not None:
-            # PCG replay batch can differ from capture-time token count; buffers are pre-sized.
             n = min(result.shape[0], output.shape[0])
             output[:n].copy_(result[:n])
             if output.shape[0] > n:
                 output[n:].fill_(-1)
         else:
             output.fill_(-1)
+
+    if _INDEXER_NO_SPLIT:
+        # NO split op: indexer kernels get folded into surrounding PCG graph segment.
+        # The indexer is still opaque to Dynamo (register_custom_op) but doesn't force
+        # a graph boundary. This means the 12 indexer kernels run inside the piecewise
+        # CUDA graph instead of as an eager gap between graph launches.
+        #
+        # Requires: TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1 for .item() calls
+        # Risk: if indexer has truly dynamic behavior, graph replay may produce wrong results
+        @register_custom_op(mutates_args=["output"])
+        def nsa_indexer_op(
+            hidden_states: torch.Tensor,
+            q_lora: torch.Tensor,
+            positions: torch.Tensor,
+            layer_id: int,
+            output: torch.Tensor,
+        ) -> None:
+            """NSA indexer (no split) — kernels included in piecewise graph segment."""
+            _nsa_indexer_impl(hidden_states, q_lora, positions, layer_id, output)
+    else:
+        # Default: split op forces a graph boundary around the indexer.
+        # Safe but creates a 12-kernel eager gap (~0.19ms/layer).
+        @register_custom_op(mutates_args=["output"])
+        @register_split_op()
+        def nsa_indexer_op(
+            hidden_states: torch.Tensor,
+            q_lora: torch.Tensor,
+            positions: torch.Tensor,
+            layer_id: int,
+            output: torch.Tensor,
+        ) -> None:
+            """NSA indexer (with split) — runs eagerly between graph segments."""
+            _nsa_indexer_impl(hidden_states, q_lora, positions, layer_id, output)
 
 
 if _use_aiter:
