@@ -62,8 +62,8 @@ if _is_cuda:
         _bmm_fp8_op(A, B, out, A_scale, B_scale)
         return out
 
-    import os as _os
-    _INDEXER_NO_SPLIT = _os.environ.get("SGLANG_INDEXER_NO_SPLIT", "0") == "1"
+    from sglang.srt.environ import envs
+    _INDEXER_NO_SPLIT = envs.SGLANG_INDEXER_NO_SPLIT.get()
 
     def _nsa_indexer_impl(
         hidden_states: torch.Tensor,

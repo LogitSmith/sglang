@@ -212,6 +212,11 @@ class Envs:
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
 
+    # NSA indexer: remove graph split boundary so indexer kernels are captured
+    # in the surrounding piecewise CUDA graph segment instead of running eagerly.
+    # Experimental — requires TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1.
+    SGLANG_INDEXER_NO_SPLIT = EnvBool(False)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
